@@ -1,10 +1,10 @@
-<img width="1278" height="1068" alt="image" src="https://github.com/user-attachments/assets/baec5de4-0523-44e0-b4e4-ac3fa4c11d0b" />
-
 # ComfyUI NVIDIA RTX VSR Long Video
 
 NVIDIA RTX Video Super Resolution for ComfyUI, optimized for **long videos with low RAM usage**.
 
 Uses NVIDIA's `nvidia-vfx` SDK to upscale, denoise, and deblur videos without loading the entire video into memory.
+
+<img width="1278" height="1068" alt="image" src="https://github.com/user-attachments/assets/baec5de4-0523-44e0-b4e4-ac3fa4c11d0b" />
 
 ## Features
 
