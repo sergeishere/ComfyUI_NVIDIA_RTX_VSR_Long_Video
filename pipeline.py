@@ -47,6 +47,7 @@ class Settings:
     frames_per_chunk: int = 48
     encoder: str = "h264_nvenc"
     ffmpeg_path: str = ""
+    fps_multiplier: int = 1
 
     def validate(self):
         if not (1.0 <= self.scale <= 4.0):
@@ -61,6 +62,8 @@ class Settings:
             raise ValueError("frames_per_chunk must be between 4 and 240.")
         if self.encoder not in ("h264_nvenc", "hevc_nvenc", "libx264"):
             raise ValueError("Unsupported encoder.")
+        if not (1 <= self.fps_multiplier <= 4):
+            raise ValueError("fps_multiplier must be between 1 and 4.")
 
 
 def output_dimensions(width: int, height: int, scale: float, quality: str) -> tuple[int, int]:
@@ -219,11 +222,27 @@ def _encode_chunk(path: Path, frame_data: Iterable[bytes], width: int, height: i
 
 
 @contextmanager
+def _work_dir(output_root: Path):
+    """Create a disposable work directory that inherits the output folder's ACL.
+
+    Not tempfile.TemporaryDirectory: on Windows (Python 3.12.4+) mkdtemp's 0o700
+    applies an owner-only ACL, which os.replace carries onto the final MP4 and
+    makes it unreadable over SMB.
+    """
+    path = output_root / f"_rtx_vsr_work_{uuid.uuid4().hex[:16]}"
+    path.mkdir()
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+@contextmanager
 def _active_work_dir(path: Path):
     """Mark an executing run with an OS lock, released on process termination.
 
     Other ComfyUI instances can detect an active run and must not delete it.
-    The lock is released before TemporaryDirectory deletes the folder on Windows.
+    The lock is released before the work directory is deleted on Windows.
     """
     marker = path / ".active.lock"
     with marker.open("w+b") as handle:
@@ -325,14 +344,18 @@ def _concat_list(cache_dir: Path, paths: list[Path]) -> Path:
     return list_path
 
 
-def _mux_output(cache_dir: Path, segments: list[Path], source: Path, destination: Path, ffmpeg_exe: str):
+def _mux_output(cache_dir: Path, segments: list[Path], source: Path, destination: Path,
+                ffmpeg_exe: str, encoder: str = "libx264"):
     playlist = _concat_list(cache_dir, segments)
     partial = cache_dir / "final.partial.mp4"
     partial.unlink(missing_ok=True)
+    # Apple players (QuickTime, Safari, Photos) only accept HEVC in MP4 as 'hvc1';
+    # FFmpeg's default 'hev1' tag makes the file unplayable on macOS/iOS.
+    tag = ["-tag:v", "hvc1"] if encoder == "hevc_nvenc" else []
     common = [ffmpeg_exe, "-hide_banner", "-loglevel", "error", "-y",
               "-f", "concat", "-safe", "0", "-i", str(playlist), "-i", str(source),
               "-map", "0:v:0", "-map", "1:a?", "-map_metadata", "1",
-              "-c:v", "copy", "-movflags", "+faststart"]
+              "-c:v", "copy", *tag, "-movflags", "+faststart"]
     try:
         try:
             _run_cmd([*common, "-c:a", "copy", str(partial)])
@@ -376,54 +399,62 @@ def process_video(source: Path, output_root: Path, settings: Settings,
             raise ValueError("Invalid video dimensions.")
         safe_stem = re.sub(r"[^A-Za-z0-9_.-]", "_", source.stem)[:72]
         destination = output_root / f"{safe_stem}_RTXVSR_{uuid.uuid4().hex[:12]}.mp4"
-        LOG.info("RTX VSR: %s → %s (%sx, %s, %s FPS), %d frames/segment",
+        out_fps = fps * settings.fps_multiplier
+        LOG.info("RTX VSR: %s → %s (%sx, %s, %s → %s FPS), %d frames/segment",
                  f"{width}x{height}", f"{dst_width}x{dst_height}", settings.scale,
-                 settings.quality, ffmpeg_rate(fps), settings.frames_per_chunk)
+                 settings.quality, ffmpeg_rate(fps), ffmpeg_rate(out_fps),
+                 settings.frames_per_chunk)
         start = time.monotonic()
         total = 0
         segment_paths: list[Path] = []
         if transform_factory is None:
             from .vfx import video_transform as transform_factory
 
-        # TemporaryDirectory also cleans partially encoded segments after
-        # exceptions and ComfyUI interrupts (unlike a persistent resume cache).
-        with tempfile.TemporaryDirectory(prefix="_rtx_vsr_work_", dir=output_root) as work, \
-                _active_work_dir(Path(work)):
+        # The work directory is also cleaned after exceptions and ComfyUI
+        # interrupts (unlike a persistent resume cache).
+        with _work_dir(output_root) as work, _active_work_dir(work):
             work_dir = Path(work)
             with ExitStack() as stack:
                 transformer = None
 
-                def finish_chunk(frames: list[bytes]):
+                def outputs(frames: list[bytes], last_chunk: bool):
+                    for i, data in enumerate(frames):
+                        produced = transformer(data, last_chunk and i == len(frames) - 1)
+                        yield from ([produced] if isinstance(produced, bytes) else produced)
+
+                def finish_chunk(frames: list[bytes], last_chunk: bool = False):
                     nonlocal transformer
                     if transformer is None:
                         transformer = stack.enter_context(
                             transform_factory(width, height, dst_width, dst_height, settings)
                         )
                     path = work_dir / f"segment_{len(segment_paths):07d}.mkv"
-                    _encode_chunk(path, (transformer(data) for data in frames),
-                                  dst_width, dst_height, fps, settings.encoder, ffmpeg_exe)
+                    _encode_chunk(path, outputs(frames, last_chunk),
+                                  dst_width, dst_height, out_fps, settings.encoder, ffmpeg_exe)
                     segment_paths.append(path)
                     LOG.info("RTX VSR: encoded segment %d (%d frames)", len(segment_paths), len(frames))
 
+                # Hold one chunk back so the final source frame is known: frame
+                # generation pads the end of the video to keep its duration.
                 frames: list[bytes] = []
                 for raw in reader:
-                    frames.append(raw)
-                    total += 1
                     if len(frames) >= settings.frames_per_chunk:
                         finish_chunk(frames)
-                        frames.clear()
+                        frames = []
+                    frames.append(raw)
+                    total += 1
                 if frames:
-                    finish_chunk(frames)
+                    finish_chunk(frames, last_chunk=True)
                     frames.clear()
 
             if not segment_paths:
                 raise RuntimeError("The source contains no decodable video frames.")
-            _mux_output(work_dir, segment_paths, source, destination, ffmpeg_exe)
+            _mux_output(work_dir, segment_paths, source, destination, ffmpeg_exe, settings.encoder)
 
         duration = time.monotonic() - start
         result = {"output": str(destination), "frames": total,
                   "processed": total, "chunks": len(segment_paths),
-                  "seconds": duration, "fps": ffmpeg_rate(fps),
+                  "seconds": duration, "fps": ffmpeg_rate(out_fps),
                   "resolution": f"{dst_width}x{dst_height}"}
         LOG.info("RTX VSR complete: %d frames, %d segments, %.1fs → %s",
                  total, len(segment_paths), duration, destination)

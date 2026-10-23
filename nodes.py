@@ -56,6 +56,12 @@ class RTX_VSR_Long_Video:
                            "per axis; choose HEVC NVENC for larger output (up to 8192 on RTX 40). "
                            "libx264 uses CPU. No automatic codec fallback."
             }),
+            "fps_multiplier": ("INT", {
+                "default": 1, "min": 1, "max": 4, "step": 1,
+                "tooltip": "NVIDIA Video Frame Generation: multiply the frame rate "
+                           "(2 = 30→60 FPS). 1 disables it. Interpolation runs at the "
+                           "source resolution, before deblur/denoise and upscaling."
+            }),
         }}
 
     RETURN_TYPES = ("STRING", "STRING", "VIDEO")
@@ -70,17 +76,18 @@ class RTX_VSR_Long_Video:
         return float("nan")
 
     def upscale_video(self, video, scale, quality, strength, preprocess,
-                      preprocess_strength, frames_per_chunk, encoder):
+                      preprocess_strength, frames_per_chunk, encoder, fps_multiplier=1):
         if video is None:
             raise ValueError("Connect a Load Video node to the 'video' input.")
         cfg = Settings(scale=scale, quality=quality, strength=strength,
                        preprocess=preprocess, preprocess_strength=preprocess_strength,
-                       frames_per_chunk=frames_per_chunk, encoder=encoder)
+                       frames_per_chunk=frames_per_chunk, encoder=encoder,
+                       fps_multiplier=fps_multiplier)
         output_root = Path(folder_paths.get_output_directory()) / "NVIDIA_RTX_VSR_Long_Video"
         with connected_video_file(video, output_root) as connected_source:
             result = process_video(connected_source, output_root, cfg)
         summary = (f"{result['frames']} frames, {result['resolution']}, "
-                   f"{result['processed']} processed, "
+                   f"{result['fps']} FPS, {result['processed']} processed, "
                    f"{result['chunks']} segments, {result['seconds']:.1f}s")
         LOG.info("RTX VSR: %s", summary)
         # Same native, file-backed VIDEO output as MiniMax H3 Final Decode.
